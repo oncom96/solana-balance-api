@@ -8,18 +8,28 @@ import (
 	"os"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
+	"github.com/patrickmn/go-cache"
+	"github.com/ulule/limiter/v3"
+	memory "github.com/ulule/limiter/v3/drivers/store/memory"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+
+	"github.com/gagliardetto/solana-go"
+	"github.com/gagliardetto/solana-go/rpc"
 )
 
 // Global vars
 var mongoClient *mongo.Client
 var apiKeysCollection *mongo.Collection
+var solanaClient *rpc.Client
+var balanceCache *cache.Cache
+var walletLocks sync.Map // map[string]*sync.Mutex
 
 // Init MongoDB
 func initMongo() {
@@ -123,6 +133,63 @@ func RecoveryWithDiscord() gin.HandlerFunc {
 	}
 }
 
+// Rate limiting middleware
+func RateLimitMiddleware() gin.HandlerFunc {
+	// 10 req / minute
+	rate, _ := limiter.NewRateFromFormatted("10-M")
+	store := memory.NewStore()
+	limiterInstance := limiter.New(store, rate)
+
+	return func(c *gin.Context) {
+		ip := c.ClientIP()
+		context, _ := limiterInstance.Get(c, ip)
+		if context.Reached {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "Rate limit exceeded"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+// Fetch Solana balance with cache + mutex
+func getBalance(ctx context.Context, wallet string) (uint64, error) {
+	// check cache
+	if val, found := balanceCache.Get(wallet); found {
+		return val.(uint64), nil
+	}
+
+	// mutex per wallet
+	muIface, _ := walletLocks.LoadOrStore(wallet, &sync.Mutex{})
+	mu := muIface.(*sync.Mutex)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// double-check after lock
+	if val, found := balanceCache.Get(wallet); found {
+		return val.(uint64), nil
+	}
+
+	// parse wallet -> solana.PublicKey
+	pubKey, err := solana.PublicKeyFromBase58(wallet)
+	if err != nil {
+		return 0, fmt.Errorf("invalid wallet address: %w", err)
+	}
+
+	// call Solana RPC
+	resp, err := solanaClient.GetBalance(ctx, pubKey, rpc.CommitmentFinalized)
+	if err != nil {
+		return 0, err
+	}
+	balance := uint64(resp.Value)
+
+	// save to cache (10s TTL)
+	balanceCache.Set(wallet, balance, 10*time.Second)
+
+	return balance, nil
+}
+
 func main() {
 	// Load .env
 	err := godotenv.Load()
@@ -139,17 +206,52 @@ func main() {
 		insertAPIKey(defaultKey)
 	}
 
+	// Init Solana client + cache
+	rpcURL := os.Getenv("SOLANA_RPC_URL")
+	if rpcURL == "" {
+		log.Fatal("❌ SOLANA_RPC_URL not set")
+	}
+	solanaClient = rpc.New(rpcURL)
+	balanceCache = cache.New(10*time.Second, 20*time.Second)
+
 	// Gin setup
 	r := gin.New()
 	r.Use(gin.Logger())
 	r.Use(RecoveryWithDiscord())
+	r.Use(RateLimitMiddleware())
 
 	// Protected routes
 	api := r.Group("/api", APIKeyAuthMiddleware())
 	{
 		api.POST("/get-balance", func(c *gin.Context) {
-			// sementara dummy response
-			c.JSON(http.StatusOK, gin.H{"message": "Balance API - Auth OK"})
+			var req struct {
+				Wallets []string `json:"wallets"`
+			}
+			if err := c.ShouldBindJSON(&req); err != nil || len(req.Wallets) == 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+				return
+			}
+
+			results := []gin.H{}
+			for _, w := range req.Wallets {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				bal, err := getBalance(ctx, w)
+				if err != nil {
+					results = append(results, gin.H{
+						"wallet":  w,
+						"error":   err.Error(),
+						"balance": 0,
+					})
+				} else {
+					results = append(results, gin.H{
+						"wallet":  w,
+						"balance": bal,
+					})
+				}
+			}
+
+			c.JSON(http.StatusOK, gin.H{"balances": results})
 		})
 
 		// Endpoint buat force panic
