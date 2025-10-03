@@ -36,3 +36,10 @@ variable "availability_zone" {
   type    = string
   default = "ap-southeast-1a"
 }
+
+variable "ssm_parameters_values" {
+  description = "Actual values for SSM parameters"
+  type        = map(string)
+  default     = {}
+}
+
