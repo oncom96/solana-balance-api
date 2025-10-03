@@ -4,3 +4,12 @@
 # Ada Library Information
 *.ali
 .env
+
+
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+crash.log
+terraform.tfvars
+
